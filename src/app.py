@@ -2,71 +2,99 @@
 This module takes care of starting the API Server, Loading the DB and Adding the endpoints
 """
 import os
-from flask import Flask, request, jsonify, url_for, send_from_directory
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from flask_migrate import Migrate
-from flask_swagger import swagger
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required, get_jwt_identity
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+
 from api.utils import APIException, generate_sitemap
-from api.models import db
+from api.models import db, User
 from api.routes import api
-from api.admin import setup_admin
-from api.commands import setup_commands
 
-# from models import Person
-
-ENV = "development" if os.getenv("FLASK_DEBUG") == "1" else "production"
-static_file_dir = os.path.join(os.path.dirname(
-    os.path.realpath(__file__)), '../dist/')
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# database condiguration
-db_url = os.getenv("DATABASE_URL")
-if db_url is not None:
-    app.config['SQLALCHEMY_DATABASE_URI'] = db_url.replace(
-        "postgres://", "postgresql://")
-else:
-    app.config['SQLALCHEMY_DATABASE_URI'] = "sqlite:////tmp/test.db"
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
+    "DATABASE_URL", "sqlite:////tmp/auth.db"
+).replace("postgres://", "postgresql://")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-this")
 
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-MIGRATE = Migrate(app, db, compare_type=True)
 db.init_app(app)
+Migrate(app, db)
 
-# add the admin
-setup_admin(app)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-# add the admin
-setup_commands(app)
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
 
-# Add all endpoints form the API with a "api" prefix
-app.register_blueprint(api, url_prefix='/api')
-
-# Handle/serialize errors like a JSON object
+jwt = JWTManager(app)
+app.register_blueprint(api, url_prefix="/api")
 
 
 @app.errorhandler(APIException)
 def handle_invalid_usage(error):
     return jsonify(error.to_dict()), error.status_code
 
-# generate sitemap with all your endpoints
+
+@app.route("/")
+def health():
+    return jsonify({"ok": True}), 200
 
 
-@app.route('/')
-def sitemap():
-    if ENV == "development":
-        return generate_sitemap(app)
-    return send_from_directory(static_file_dir, 'index.html')
+@app.route("/signup", methods=["POST", "OPTIONS"])
+def signup():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json() or {}
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    if not email or not password:
+        return jsonify({"msg": "email y password requeridos"}), 400
+    if User.query.filter_by(email=email).first():
+        return jsonify({"msg": "email ya registrado"}), 409
+    user = User(
+        email=email,
+        password=generate_password_hash(password),
+        is_active=True
+    )
+    db.session.add(user)
+    db.session.commit()
+    return jsonify(user.serialize()), 201
 
-# any other endpoint will try to serve it like a static file
-@app.route('/<path:path>', methods=['GET'])
-def serve_any_other_file(path):
-    if not os.path.isfile(os.path.join(static_file_dir, path)):
-        path = 'index.html'
-    response = send_from_directory(static_file_dir, path)
-    response.cache_control.max_age = 0  # avoid cache memory
-    return response
+
+@app.route("/token", methods=["POST", "OPTIONS"])
+def token():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json() or {}
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password, password):
+        return jsonify({"msg": "credenciales inválidas"}), 401
+    access = create_access_token(identity=str(user.id))
+    return jsonify({"access_token": access, "user": user.serialize()}), 200
 
 
-# this only runs if `$ python src/main.py` is executed
-if __name__ == '__main__':
-    PORT = int(os.environ.get('PORT', 3001))
-    app.run(host='0.0.0.0', port=PORT, debug=True)
+@app.route("/private", methods=["GET", "OPTIONS"])
+@jwt_required(optional=True)
+def private():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    uid = get_jwt_identity()
+    if not uid:
+        return jsonify({"msg": "token requerido"}), 401
+    user = User.query.get(int(uid))
+    return jsonify({"ok": True, "user": user.serialize()}), 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 3001)), debug=True)
